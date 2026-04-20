@@ -10,8 +10,9 @@ weirder access pattern: a query for `"how do I deploy a model on GKE"` semantica
 overlaps with `"deploy LLM kubernetes guide"`, even though they're cache-misses
 under exact-match keying.
 
-The vLLM PagedAttention paper showed how much memory waste exists when KV-cache
-allocation assumes worst-case sequence lengths. I started wondering: do embedding
+The vLLM [PagedAttention paper](https://arxiv.org/abs/2309.06180) showed how
+much memory waste exists when KV-cache allocation assumes worst-case
+sequence lengths. I started wondering: do embedding
 caches in retrieval pipelines have an analogous waste problem? And if so, can a small
 predictor model proactively warm the cache for likely-next queries?
 
@@ -68,6 +69,8 @@ until I have real benchmarks.
 
 ## References
 
-- Kwon et al., *Efficient Memory Management for Large Language Model Serving with PagedAttention* (vLLM, 2023)
-- Belady, *A study of replacement algorithms for a virtual-storage computer* (IBM, 1966)
-- Reimers & Gurevych, *Sentence-BERT* (2019) — for the similarity threshold intuition
+- Kwon et al., [*Efficient Memory Management for Large Language Model Serving with PagedAttention*](https://arxiv.org/abs/2309.06180) (vLLM, 2023)
+- Belady, [*A study of replacement algorithms for a virtual-storage computer*](https://ieeexplore.ieee.org/document/5388441) (IBM, 1966)
+- Reimers & Gurevych, [*Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks*](https://arxiv.org/abs/1908.10084) (EMNLP, 2019)
+- [BEIR benchmark](https://github.com/beir-cellar/beir) — for thinking about realistic retrieval traces
+- [vLLM](https://github.com/vllm-project/vllm) — reference implementation of PagedAttention
