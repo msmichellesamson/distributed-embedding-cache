@@ -1,0 +1,384 @@
+name: Performance Regression Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+
+env:
+  PYTHON_VERSION: "3.11"
+  REDIS_VERSION: "7.2"
+
+jobs:
+  performance-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    services:
+      redis-node-1:
+        image: redis:7.2-alpine
+        ports:
+          - 7001:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis-node-2:
+        image: redis:7.2-alpine
+        ports:
+          - 7002:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis-node-3:
+        image: redis:7.2-alpine
+        ports:
+          - 7003:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    strategy:
+      matrix:
+        test-scenario:
+          - cache-throughput
+          - embedding-similarity
+          - precompute-latency
+          - cluster-failover
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+        cache-dependency-path: |
+          requirements.txt
+          requirements-dev.txt
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          redis-tools \
+          build-essential \
+          libblas-dev \
+          liblapack-dev \
+          gfortran
+
+    - name: Cache PyTorch models
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/torch
+        key: torch-models-${{ hashFiles('src/models/precompute_model.py') }}
+        restore-keys: |
+          torch-models-
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+
+    - name: Setup Redis Cluster
+      run: |
+        # Create Redis cluster configuration
+        mkdir -p /tmp/redis-cluster
+        cat > /tmp/redis-cluster/cluster-setup.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        # Wait for Redis nodes to be ready
+        for port in 7001 7002 7003; do
+          echo "Waiting for Redis on port $port..."
+          timeout 30 bash -c "until redis-cli -p $port ping; do sleep 1; done"
+        done
+        
+        # Create cluster
+        redis-cli --cluster create \
+          127.0.0.1:7001 \
+          127.0.0.1:7002 \
+          127.0.0.1:7003 \
+          --cluster-replicas 0 \
+          --cluster-yes
+        
+        # Wait for cluster to be ready
+        sleep 5
+        redis-cli -p 7001 cluster info
+        EOF
+        
+        chmod +x /tmp/redis-cluster/cluster-setup.sh
+        /tmp/redis-cluster/cluster-setup.sh
+
+    - name: Warm up models
+      run: |
+        export REDIS_CLUSTER_NODES="localhost:7001,localhost:7002,localhost:7003"
+        python -c "
+        import asyncio
+        from src.models.precompute_model import PrecomputeModel
+        
+        async def warmup():
+            model = PrecomputeModel()
+            await model.initialize()
+            # Generate dummy embeddings to trigger model loading
+            test_embeddings = await model.generate_embeddings(['test query'])
+            print(f'Warmup complete. Generated {len(test_embeddings)} embeddings')
+        
+        asyncio.run(warmup())
+        "
+
+    - name: Run performance benchmarks
+      env:
+        REDIS_CLUSTER_NODES: "localhost:7001,localhost:7002,localhost:7003"
+        PERFORMANCE_SCENARIO: ${{ matrix.test-scenario }}
+        BENCHMARK_DURATION: "120"  # 2 minutes
+        BENCHMARK_THREADS: "10"
+      run: |
+        python -m pytest tests/integration/test_cache_performance.py::test_${{ matrix.test-scenario }}_performance \
+          --benchmark-columns=min,max,mean,stddev,ops,rounds \
+          --benchmark-histogram=benchmarks/histogram-${{ matrix.test-scenario }}.svg \
+          --benchmark-json=benchmarks/results-${{ matrix.test-scenario }}.json \
+          --benchmark-warmup=on \
+          --benchmark-warmup-iterations=3 \
+          -v -s
+
+    - name: Generate performance report
+      if: always()
+      run: |
+        python scripts/generate_performance_report.py \
+          --scenario ${{ matrix.test-scenario }} \
+          --results-file benchmarks/results-${{ matrix.test-scenario }}.json \
+          --output-file performance-report-${{ matrix.test-scenario }}.md
+
+    - name: Check performance regression
+      env:
+        PERFORMANCE_THRESHOLD_CACHE_OPS: "10000"      # ops/sec
+        PERFORMANCE_THRESHOLD_LATENCY_P95: "50"       # milliseconds
+        PERFORMANCE_THRESHOLD_MEMORY_MB: "512"        # MB
+        PERFORMANCE_THRESHOLD_ERROR_RATE: "0.01"      # 1%
+      run: |
+        python scripts/check_performance_regression.py \
+          --results-file benchmarks/results-${{ matrix.test-scenario }}.json \
+          --baseline-branch main \
+          --threshold-ops ${{ env.PERFORMANCE_THRESHOLD_CACHE_OPS }} \
+          --threshold-latency-p95 ${{ env.PERFORMANCE_THRESHOLD_LATENCY_P95 }} \
+          --threshold-memory ${{ env.PERFORMANCE_THRESHOLD_MEMORY_MB }} \
+          --threshold-error-rate ${{ env.PERFORMANCE_THRESHOLD_ERROR_RATE }}
+
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: performance-results-${{ matrix.test-scenario }}
+        path: |
+          benchmarks/results-${{ matrix.test-scenario }}.json
+          benchmarks/histogram-${{ matrix.test-scenario }}.svg
+          performance-report-${{ matrix.test-scenario }}.md
+        retention-days: 30
+
+    - name: Store performance metrics
+      if: always()
+      run: |
+        # Store metrics for trend analysis
+        python scripts/store_performance_metrics.py \
+          --results-file benchmarks/results-${{ matrix.test-scenario }}.json \
+          --commit-sha ${{ github.sha }} \
+          --branch ${{ github.ref_name }} \
+          --pr-number ${{ github.event.number }}
+
+  load-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: performance-test
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Start distributed cache cluster
+      run: |
+        docker-compose -f docker-compose.perf.yml up -d
+        sleep 30  # Wait for services to be ready
+
+    - name: Run distributed load test
+      env:
+        LOAD_TEST_DURATION: "600"     # 10 minutes
+        LOAD_TEST_RPS: "1000"         # requests per second
+        LOAD_TEST_CLIENTS: "50"       # concurrent clients
+        CACHE_CLUSTER_ENDPOINT: "localhost:8080"
+      run: |
+        python scripts/distributed_load_test.py \
+          --duration ${{ env.LOAD_TEST_DURATION }} \
+          --rps ${{ env.LOAD_TEST_RPS }} \
+          --clients ${{ env.LOAD_TEST_CLIENTS }} \
+          --endpoint ${{ env.CACHE_CLUSTER_ENDPOINT }} \
+          --output-file load-test-results.json
+
+    - name: Analyze load test results
+      run: |
+        python scripts/analyze_load_test.py \
+          --results-file load-test-results.json \
+          --sla-latency-p99 100 \
+          --sla-error-rate 0.005 \
+          --sla-throughput 800
+
+    - name: Upload load test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: load-test-results
+        path: |
+          load-test-results.json
+          load-test-analysis.html
+        retention-days: 30
+
+    - name: Cleanup
+      if: always()
+      run: |
+        docker-compose -f docker-compose.perf.yml down -v
+
+  memory-profiling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install profiling dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install memory-profiler psutil
+
+    - name: Run memory profiling
+      env:
+        REDIS_CLUSTER_NODES: "localhost:7001,localhost:7002,localhost:7003"
+      run: |
+        # Start Redis for profiling
+        docker run -d --name redis-profile -p 7001:6379 redis:7.2-alpine
+        sleep 5
+        
+        # Profile memory usage during high-load operations
+        python -m memory_profiler scripts/profile_memory_usage.py \
+          --embeddings-count 10000 \
+          --batch-size 100 \
+          --output-file memory-profile.txt
+
+    - name: Generate memory report
+      run: |
+        python scripts/analyze_memory_profile.py \
+          --profile-file memory-profile.txt \
+          --threshold-peak-mb 1024 \
+          --output-file memory-analysis.md
+
+    - name: Upload memory profile
+      uses: actions/upload-artifact@v3
+      with:
+        name: memory-profile
+        path: |
+          memory-profile.txt
+          memory-analysis.md
+        retention-days: 14
+
+    - name: Cleanup profiling
+      if: always()
+      run: |
+        docker stop redis-profile || true
+        docker rm redis-profile || true
+
+  performance-summary:
+    runs-on: ubuntu-latest
+    needs: [performance-test, load-test, memory-profiling]
+    if: always()
+    
+    steps:
+    - name: Download all performance artifacts
+      uses: actions/download-artifact@v3
+
+    - name: Generate consolidated performance report
+      run: |
+        python -c "
+        import json
+        import os
+        from datetime import datetime
+        
+        # Collect all performance results
+        results = {}
+        for root, dirs, files in os.walk('.'):
+            for file in files:
+                if file.endswith('results.json'):
+                    with open(os.path.join(root, file)) as f:
+                        scenario = file.replace('results-', '').replace('.json', '')
+                        results[scenario] = json.load(f)
+        
+        # Generate summary
+        summary = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'commit_sha': os.environ.get('GITHUB_SHA'),
+            'scenarios': results,
+            'overall_status': 'PASS' if len(results) > 0 else 'FAIL'
+        }
+        
+        with open('performance-summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        print('Performance Summary Generated')
+        print(f'Tested scenarios: {list(results.keys())}')
+        "
+
+    - name: Comment PR with performance results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const summary = JSON.parse(fs.readFileSync('performance-summary.json', 'utf8'));
+          
+          let comment = '## Performance Test Results 🚀\n\n';
+          comment += `**Commit:** ${summary.commit_sha}\n`;
+          comment += `**Status:** ${summary.overall_status}\n\n`;
+          
+          for (const [scenario, data] of Object.entries(summary.scenarios)) {
+            comment += `### ${scenario}\n`;
+            if (data.benchmarks) {
+              const bench = data.benchmarks[0];
+              comment += `- **Ops/sec:** ${bench.stats.ops.toFixed(0)}\n`;
+              comment += `- **Mean latency:** ${(bench.stats.mean * 1000).toFixed(2)}ms\n`;
+              comment += `- **P95 latency:** ${(bench.stats.q95 * 1000).toFixed(2)}ms\n`;
+            }
+            comment += '\n';
+          }
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
